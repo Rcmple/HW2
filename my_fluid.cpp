@@ -10,6 +10,7 @@
 #include <variant>
 #include <tuple>
 #include <charconv>
+#include <fstream>
 #include "FixedClass.h"
 #ifdef FLOAT
 #error "FLOAT is already defined"
@@ -31,7 +32,7 @@
 #define DOUBLE double
 #define FAST_FIXED(N, K) types::FastFixed<N, K>
 #define FIXED(N, K)      types::Fixed<N, K>
-#define S(N, M) types::SizePair{.rows = N, .columns = M, }
+#define S(N, M) types::sz{.rows = N, .columns = M, }
 #define STRINGIFY(expr) #expr
 inline constexpr std::string_view kFloatTypeName = STRINGIFY(FLOAT);
 inline constexpr std::string_view kDoubleTypeName = STRINGIFY(DOUBLE);
@@ -50,7 +51,16 @@ namespace types {
     };
 
     struct Durex {
+        std::size_t n, m;
         std::vector<std::vector<char>> field;
+        double water_rho, air_rho, g;
+
+        void resize() {
+            field.resize(n);
+            for(auto& str : field) {
+                str.resize(m + 1);
+            }
+        }
     };
 
     template <class... ZipPack>
@@ -77,7 +87,7 @@ namespace types {
     class Simulator {
         static constexpr std::array<std::pair<int, int>, 4> deltas{{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}};
         static constexpr bool static_flag = (Rows != dyn_flag) && (Columns != dyn_flag);
-        //Для поля в котором на 1 меньше столбик
+        //Для поля в котором на 1 больше столбик
         template <class EType>
          using StaticField = std::array<std::array<EType, Columns + 1>, Rows>;
         template <class EType>
@@ -105,12 +115,9 @@ namespace types {
 
             VectorField(std::size_t cur_sz, const CurType& str) requires (!static_flag) :
             v{cur_sz, str} {}
-
-
             EType &add(int x, int y, int dx, int dy, EType& dv) {
                 return get(x, y, dx, dy) += dv;
             }
-
             EType &get(int x, int y, int dx, int dy) {
                 size_t ind= std::ranges::find(deltas, std::pair(dx, dy)) - deltas.begin();
                 assert(ind < deltas.size());
@@ -162,9 +169,9 @@ namespace types {
     };
 
     template <class PPType, class VType, class VFlowType,
-            std::size_t rows = dyn_flag, std::size_t columns = dyn_flag>
+            std::size_t Rows = dyn_flag, std::size_t Columns = dyn_flag>
     void start_on_field(const Durex& cur) {
-        Simulator<PPType, VType, VFlowType, rows, columns> a{cur};
+        Simulator<PPType, VType, VFlowType, Rows, Columns> a{cur};
         a.start();
     }
 
@@ -173,17 +180,17 @@ namespace types {
     void select_size_and_start(const Durex& cur) {
         if(CurSize.rows == cur.field.size() && CurSize.columns == cur.field.front().size() - 1) {
             start_on_field<PPType, VType, VFlowType, CurSize.rows, CurSize.columns>(cur);
-        } else if(sizeof...(LeftSizes) > 0){
+        } else if constexpr (sizeof...(LeftSizes) > 0){
             select_size_and_start<PPType, VType, VFlowType, LeftSizes...>(cur);
         } else{
-            select_size_and_start<PPType, VType, VFlowType>(cur);
+            start_on_field<PPType, VType, VFlowType>(cur);
         }
     }
 
-    template <class PPType, class VType, class VFlowType, class... Sizes>
+    template <class PPType, class VType, class VFlowType, sz... LeftSizes>
     void select_size_and_start_with_sizes(const Durex& cur) {
-        if constexpr (sizeof...(Sizes) > 0) {
-            select_size_and_start<PPType, VType, VFlowType, Sizes...>(cur);
+        if constexpr (sizeof...(LeftSizes) > 0) {
+            select_size_and_start<PPType, VType, VFlowType, LeftSizes...>(cur);
         } else {
             start_on_field<PPType, VType, VFlowType>(cur);
         }
@@ -275,19 +282,19 @@ namespace types {
 
             if constexpr (requires {
                 {
-                    CurType::kNValue == std::size_t{}
+                    CurType::NFromFixed == std::size_t{}
                 } -> std::same_as<bool>;
 
                 {
-                    CurType::kKValue == std::size_t{}
+                    CurType::KFromFixed == std::size_t{}
                 } -> std::same_as<bool>;
 
                 {
-                    CurType::kFast == bool{}
+                    CurType::FastFromFixed == bool{}
                 } -> std::same_as<bool>;
                 }) {
-                if constexpr (CurType::kFast == Fast) {
-                    if(CurType::kNValue == n && CurType::kKValue == k) {
+                if constexpr (CurType::FastFromFixed == Fast) {
+                    if(CurType::NFromFixed == n && CurType::KFromFixed == k) {
                         get_next_type_and_start<CurType, DirtyTypes...>(cur, types...);
                         return true;
                     }
@@ -312,7 +319,7 @@ namespace types {
         }
     };
 
-    struct SimulationParams {
+    struct RunTimeSettings {
         std::string_view p_type_name{};
         std::string_view v_type_name{};
         std::string_view v_flow_type_name{};
@@ -324,8 +331,8 @@ namespace types {
     template <class... FloatTypes, sz... AllSizes>
     class Go<List<FloatTypes...>, AllSizes...> {
     public:
-        static Go from_params(SimulationParams params) {
-            return Go{std::move(params)};
+        static Go SaveInfo(RunTimeSettings Settings) {
+            return Go{std::move(Settings)};
         }
 
         void start_on_field(const Durex& cur) {
@@ -334,9 +341,9 @@ namespace types {
         }
 
     private:
-        explicit constexpr Go(SimulationParams&& params) : params{std::move(params)} {}
+        explicit constexpr Go(RunTimeSettings&& params) : params{std::move(params)} {}
 
-        SimulationParams params;
+        RunTimeSettings params;
     };
 }
 
@@ -353,24 +360,68 @@ using Go = types::Go<types::List<TYPES>, SIZES>;
 using Go = types::Go<types::List<TYPES>>;
 
 #endif
+void read_from_file_and_start(int argc = 0, char* argv[] = nullptr) {
+    types::RunTimeSettings settings;
 
-int main() {
-    Go simulator = Go::from_params(types::SimulationParams{
-            .p_type_name      = "FLOAT",
-            .v_type_name      = "FAST_FIXED(32,  5)",
-            .v_flow_type_name = "DOUBLE",
-    });
+    std::string p_type, v_type, v_flow_type;
 
-    simulator.start_on_field(types::Durex{
-            .field =
-            std::vector<std::vector<char>>{
-                    {'#', '.', '.', '#', '#'},
-                    {'#', '.', '.', '.', '#'},
-                    {'#', '#', '#', '#', '#'},
-            },
-    });
-    types::FastFixed<32, 16> a(1);
-    types::FastFixed<32, 16> b(5);
-    types::FastFixed<32, 16> sum = a / b;
-    std::cout << sum << std::endl;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg.starts_with("--p-type=")) {
+            p_type = arg.substr(9);
+            settings.p_type_name = p_type;
+        } else if (arg.starts_with("--v-type=")) {
+            v_type = arg.substr(9);
+            settings.v_type_name = v_type;
+        } else if (arg.starts_with("--v-flow-type=")) {
+            v_flow_type = arg.substr(14);
+            settings.v_flow_type_name = v_flow_type;
+        }
+    }
+
+    Go simulator = Go::SaveInfo(settings);
+
+    std::ifstream in("/mnt/d/Rcmple/cpp_project_2/example_field.txt");
+    types::Durex cur;
+    in >> cur.n >> cur.m;
+    cur.resize();
+    in >> cur.water_rho >> cur.air_rho >> cur.g;
+    in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    for(auto& str : cur.field) {
+        std::string cur_str;
+        getline(in, cur_str);
+        if(!cur_str.empty()) {
+            if(cur_str.back() == '\r') {
+                cur_str.pop_back();
+            }
+        }
+        std::ranges::copy(cur_str, str.begin());
+    }
+
+    simulator.start_on_field(cur);
+}
+int main(int argc, char* argv[]) {
+    bool p_type_set = false;
+    bool v_type_set = false;
+    bool v_flow_type_set = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg.starts_with("--p-type=")) {
+            p_type_set = true;
+        } else if (arg.starts_with("--v-type=")) {
+            v_type_set = true;
+        } else if (arg.starts_with("--v-flow-type=")) {
+            v_flow_type_set = true;
+        }
+    }
+
+    if (p_type_set && v_type_set && v_flow_type_set) {
+        read_from_file_and_start(argc, argv);
+    } else {
+        std::cerr << "Error: Missing required parameters. Please provide --p-type, --v-type, and --v-flow-type." << std::endl;
+        return 1;
+    }
+
+    return 0;
 }

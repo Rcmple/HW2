@@ -42,9 +42,9 @@ namespace types {
         >;
         ValueType value;
     public:
-        static constexpr std::size_t kNValue = N;
-        static constexpr std::size_t kKValue = K;
-        static constexpr bool kFast = Fast;
+        static constexpr std::size_t NFromFixed = N;
+        static constexpr std::size_t KFromFixed = K;
+        static constexpr bool FastFromFixed = Fast;
 
         constexpr Fixed() : value(0) {}
 
