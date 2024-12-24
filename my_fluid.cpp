@@ -12,6 +12,8 @@
 #include <charconv>
 #include <fstream>
 #include "FixedClass.h"
+#include "Double.h"
+#include "Float.h"
 #ifdef FLOAT
 #error "FLOAT is already defined"
 #endif
@@ -42,7 +44,6 @@ inline constexpr std::string_view Fpref = "FIXED(";
 inline constexpr std::string_view Fsuf = ")";
 constexpr size_t T = 1'000'000;
 #undef STRINGIFY
-
 namespace types {
     //Начинаю simulation
 
@@ -115,7 +116,7 @@ namespace types {
 
             VectorField(std::size_t cur_sz, const CurType& str) requires (!static_flag) :
             v{cur_sz, str} {}
-            EType &add(int x, int y, int dx, int dy, EType& dv) {
+            EType &add(int x, int y, int dx, int dy,const EType& dv) {
                 return get(x, y, dx, dy) += dv;
             }
             EType &get(int x, int y, int dx, int dy) {
@@ -130,6 +131,7 @@ namespace types {
         using VField = VectorField<VType>;
         using VFlowField = VectorField<VFlowType>;
         using LastUseField = FieldType<int>;
+        using dirsField = FieldType<int>;
 
         explicit constexpr Simulator(const Durex& cur) noexcept requires (static_flag) {
             for(std::size_t ind = 0; auto& str : field) {
@@ -140,16 +142,283 @@ namespace types {
         }
         explicit constexpr Simulator(const Durex& cur)
         requires(!static_flag)
-                : Simulator(cur, cur.field.size(), cur.field.front().size() - 1) {}
+                : Simulator(cur, cur.n, cur.m - 1) {}
         [[nodiscard]] constexpr std::size_t get_n() const noexcept {
             return field.size();
         }
         [[nodiscard]] constexpr std::size_t get_m() const noexcept {
             return field.front().size() - 1;
         }
+        std::tuple<PPType, bool, std::pair<int, int>> propagate_flow(int x, int y, PPType lim) {
+            last_use_field[x][y] = UT - 1;
+            auto ret = PPType(0);
+            for (auto [dx, dy] : deltas) {
+                int nx = x + dx, ny = y + dy;
+                if (field[nx][ny] != '#' && last_use_field[nx][ny] < UT) {
+                    auto cap = v_field.get(x, y, dx, dy);
+                    auto flow = v_flow_field.get(x, y, dx, dy);
+                    if (VType(flow) == cap) {
+                        continue;
+                    }
+                    // assert(v >= velocity_flow.get(x, y, dx, dy));
+                    auto vp = types::min(VType(lim), cap - VType(flow));
+                    if (last_use_field[nx][ny] == UT - 1) {
+                        v_flow_field.add(x, y, dx, dy, VFlowType(vp));
+                        last_use_field[x][y] = UT;
+                        // cerr << x << " " << y << " -> " << nx << " " << ny << " " << vp << " / " << lim << "\n";
+                        return {PPType(vp), 1, {nx, ny}};
+                    }
+                    auto [t, prop, end] = propagate_flow(nx, ny, PPType(vp));
+                    ret += t;
+                    if (prop) {
+                        v_flow_field.add(x, y, dx, dy, VFlowType(t));
+                        last_use_field[x][y] = UT;
+                        // cerr << x << " " << y << " -> " << nx << " " << ny << " " << t << " / " << lim << "\n";
+                        return {t, prop && end != std::pair(x, y), end};
+                    }
+                }
+            }
+            last_use_field[x][y] = UT;
+            return {ret, 0, {0, 0}};
+        }
 
-        void start() {
+        void propagate_stop(int x, int y, bool force = false) {
+            if (!force) {
+                bool stop = true;
+                for (auto [dx, dy] : deltas) {
+                    int nx = x + dx, ny = y + dy;
+                    if (field[nx][ny] != '#' && last_use_field[nx][ny] < UT - 1 && v_field.get(x, y, dx, dy) > VType(0)) {
+                        stop = false;
+                        break;
+                    }
+                }
+                if (!stop) {
+                    return;
+                }
+            }
+            last_use_field[x][y] = UT;
+            for (auto [dx, dy] : deltas) {
+                int nx = x + dx, ny = y + dy;
+                if (field[nx][ny] == '#' || last_use_field[nx][ny] == UT || v_field.get(x, y, dx, dy) > VType(0)) {
+                    continue;
+                }
+                propagate_stop(nx, ny);
+            }
+        }
 
+        PPType move_prob(int x, int y) {
+            auto sum = PPType(0);
+            for (auto [dx, dy] : deltas) {
+                int nx = x + dx, ny = y + dy;
+                if (field[nx][ny] == '#' || last_use_field[nx][ny] == UT) {
+                    continue;
+                }
+                auto v = v_field.get(x, y, dx, dy);
+                if (v < VType(0)) {
+                    continue;
+                }
+                sum += PPType(v);
+            }
+            return sum;
+        }
+
+        struct ParticleParams {
+            char type;
+            PPType cur_p;
+            std::array<VType, deltas.size()> v;
+
+            void swap_with(Simulator& simulator, int x, int y) {
+                char field_cell = simulator.field[x][y];
+                simulator.field[x][y] = type;
+                type = field_cell;
+                PPType p_copy = simulator.p[x][y];
+                simulator.p[x][y] = cur_p;
+                cur_p = p_copy;
+                swap(simulator.v_field.v[x][y], v);
+            }
+        };
+
+        double random01() {
+            return (rnd() & ((1 << 16) - 1));
+        }
+
+        bool propagate_move(int x, int y, bool is_first) {
+            last_use_field[x][y] = UT - is_first;
+            bool ret = false;
+            int nx = -1, ny = -1;
+            do {
+                std::array<PPType, deltas.size()> tres{};
+                auto sum = PPType(0);
+                for (size_t i = 0; i < deltas.size(); ++i) {
+                    auto [dx, dy] = deltas[i];
+                    nx = x + dx, ny = y + dy;
+                    if (field[nx][ny] == '#' || last_use_field[nx][ny] == UT) {
+                        tres[i] = sum;
+                        continue;
+                    }
+                    auto v = v_field.get(x, y, dx, dy);
+                    if (v < VType(0)) {
+                        tres[i] = sum;
+                        continue;
+                    }
+                    sum += PPType(v);
+                    tres[i] = sum;
+                }
+
+                if (sum == PPType(0)) {
+                    break;
+                }
+
+                PPType pp = PPType(random01()) * sum;
+                size_t d = std::ranges::upper_bound(tres, pp) - tres.begin();
+
+                auto [dx, dy] = deltas[d];
+                nx = x + dx;
+                ny = y + dy;
+                assert(v_field.get(x, y, dx, dy) > VType(0) && field[nx][ny] != '#' && last_use_field[nx][ny] < UT);
+
+                ret = (last_use_field[nx][ny] == UT - 1 || propagate_move(nx, ny, false));
+            } while (!ret);
+            last_use_field[x][y] = UT;
+            for (auto [dx, dy] : deltas) {
+                nx = x + dx, ny = y + dy;
+                if (field[nx][ny] != '#' && last_use_field[nx][ny] < UT - 1 && v_field.get(x, y, dx, dy) < VType(0)) {
+                    propagate_stop(nx, ny);
+                }
+            }
+            if (ret) {
+                if (!is_first) {
+                    ParticleParams pp{};
+                    pp.swap_with(*this, x, y);
+                    pp.swap_with(*this, nx, ny);
+                    pp.swap_with(*this, x, y);
+                }
+            }
+            return ret;
+        }
+
+        void start(const Durex& cur) {
+            rho[' '] = PPType(0.01);
+            rho['.'] = PPType(1000);
+            VType g(0.1);
+            size_t N  = get_n();
+            size_t M = get_m();
+            for (size_t x = 0; x < N; ++x) {
+                for (size_t y = 0; y < M; ++y) {
+                    if (field[x][y] == '#')
+                        continue;
+                    for (auto [dx, dy] : deltas) {
+                        dirs[x][y] += (field[x + dx][y + dy] != '#');
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < T; ++i) {
+                PPType total_delta_p(0);
+                // Apply external forces
+                for (size_t x = 0; x < N; ++x) {
+                    for (size_t y = 0; y < M; ++y) {
+                        if (field[x][y] == '#')
+                            continue;
+                        if (field[x + 1][y] != '#')
+                            v_field.add(x, y, 1, 0, g);
+                    }
+                }
+
+                // Apply forces from p
+                std::copy(p.begin(), p.end(), p_old.begin());
+                for (size_t x = 0; x < N; ++x) {
+                    for (size_t y = 0; y < M; ++y) {
+                        if (field[x][y] == '#')
+                            continue;
+                        for (auto [dx, dy] : deltas) {
+                            int nx = x + dx, ny = y + dy;
+                            if (field[nx][ny] != '#' && p_old[nx][ny] < p_old[x][y]) {
+                                auto delta_p = p_old[x][y] - p_old[nx][ny];
+                                auto force = delta_p;
+                                auto &contr = v_field.get(nx, ny, -dx, -dy);
+                                if (contr * VType(rho[(int) field[nx][ny]]) >= VType(force)) {
+                                    contr -= VType(force / rho[(int) field[nx][ny]]);
+                                    continue;
+                                }
+                                force -= PPType(contr) * rho[(int) field[nx][ny]];
+                                contr = VType(0);
+                                v_field.add(x, y, dx, dy, (VType(force) / VType(rho[(int) field[x][y]])));
+                                p[x][y] -= force / PPType(dirs[x][y]);
+                                total_delta_p -= force / PPType(dirs[x][y]);
+                            }
+                        }
+                    }
+                }
+
+                // Make flow from velocities
+                bool prop = false;
+                do {
+                    UT += 2;
+                    prop = false;
+                    for (size_t x = 0; x < N; ++x) {
+                        for (size_t y = 0; y < M; ++y) {
+                            if (field[x][y] != '#' && last_use_field[x][y] != UT) {
+                                auto [t, local_prop, _] = propagate_flow(x, y, PPType(1));
+                                if (t > PPType(0)) {
+                                    prop = 1;
+                                }
+                            }
+                        }
+                    }
+                } while (prop);
+
+                // Recalculate p with kinetic energy
+                for (size_t x = 0; x < N; ++x) {
+                    for (size_t y = 0; y < M; ++y) {
+                        if (field[x][y] == '#')
+                            continue;
+                        for (auto [dx, dy] : deltas) {
+                            auto old_v = v_field.get(x, y, dx, dy);
+                            auto new_v = v_flow_field.get(x, y, dx, dy);
+                            if (old_v > VType(0)) {
+                                assert(VType(new_v) <= old_v);
+                                v_field.get(x, y, dx, dy) = VType(new_v);
+                                auto force = (old_v - VType(new_v)) * VType(rho[(int) field[x][y]]);
+                                if (field[x][y] == '.')
+                                    force *= VType(0.8);
+                                if (field[x + dx][y + dy] == '#') {
+                                    p[x][y] += PPType(force / VType(dirs[x][y]));
+                                    total_delta_p += PPType(force / VType(dirs[x][y]));
+                                } else {
+                                    p[x + dx][y + dy] += PPType(force / VType(dirs[x + dx][y + dy]));
+                                    total_delta_p += PPType(force / VType(dirs[x + dx][y + dy]));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                UT += 2;
+                prop = false;
+                for (size_t x = 0; x < N; ++x) {
+                    for (size_t y = 0; y < M; ++y) {
+                        if (field[x][y] != '#' && last_use_field[x][y] != UT) {
+                            if (PPType(random01()) < move_prob(x, y)) {
+                                prop = true;
+                                propagate_move(x, y, true);
+                            } else {
+                                propagate_stop(x, y, true);
+                            }
+                        }
+                    }
+                }
+
+                if (prop) {
+                    std::cout << "Tick " << i << ":\n";
+                    for (size_t x = 0; x < N; ++x) {
+                        for (size_t y = 0; y < M; ++y) {
+                            std::cout << field[x][y];
+                        }
+                        std::cout << '\n';
+                    }
+                }
+            }
         }
     private:
         explicit constexpr Simulator(const Durex& cur, std::size_t rows, std::size_t columns) requires(!static_flag):
@@ -158,21 +427,25 @@ namespace types {
                 p_old{rows, typename PPField::value_type(columns)},
                 v_field{rows, typename VField::CurType(columns)},
                 v_flow_field{rows, typename VFlowField::CurType(columns)},
-                last_use_field{rows, typename LastUseField::value_type(columns)} {}
+                last_use_field{rows, typename LastUseField::value_type(columns)},
+                rnd(1337),
+                dirs{rows, typename dirsField::value_type(columns)}{}
         Field field{};
         PPField p, p_old{};
         VField v_field{};
         VFlowField v_flow_field{};
         LastUseField last_use_field{};
+        dirsField dirs{};
         int UT = 0;
         std::array <PPType, 256> rho{};
+        std::mt19937 rnd;
     };
 
     template <class PPType, class VType, class VFlowType,
             std::size_t Rows = dyn_flag, std::size_t Columns = dyn_flag>
     void start_on_field(const Durex& cur) {
         Simulator<PPType, VType, VFlowType, Rows, Columns> a{cur};
-        a.start();
+        a.start(cur);
     }
 
     template <class PPType, class VType, class VFlowType,
