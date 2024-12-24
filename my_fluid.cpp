@@ -408,8 +408,6 @@ namespace types {
                         }
                     }
                 }
-
-                if (prop) {
                     std::cout << "Tick " << i << ":\n";
                     for (size_t x = 0; x < N; ++x) {
                         for (size_t y = 0; y < M; ++y) {
@@ -417,7 +415,6 @@ namespace types {
                         }
                         std::cout << '\n';
                     }
-                }
             }
         }
     private:
